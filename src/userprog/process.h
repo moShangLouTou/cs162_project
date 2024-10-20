@@ -3,7 +3,8 @@
 
 #include "threads/thread.h"
 #include <stdint.h>
-
+#include "userprog/darray.h"
+#include <list.h>
 // At most 8MB can be allocated to the stack
 // These defines will be used in Project 2: Multithreading
 #define MAX_STACK_PAGES (1 << 11)
@@ -24,9 +25,14 @@ typedef void (*stub_fun)(pthread_fun, void*);
    of the process, which is `special`. */
 struct process {
   /* Owned by process.c. */
+  pid_t pid;
   uint32_t* pagedir;          /* Page directory. */
   char process_name[16];      /* Name of the main thread */
   struct thread* main_thread; /* Pointer to main thread */
+  struct darray open_files;
+  struct process* parent;
+  struct list_elem elem;
+  struct list children;
 };
 
 void userprog_init(void);

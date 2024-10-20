@@ -44,6 +44,8 @@ void userprog_init(void) {
 
   /* Kill the kernel if we did not succeed */
   ASSERT(success);
+  t->pcb->main_thread = t;
+  list_init(&t->pcb->children);
 }
 
 /* Starts a new thread running a user program loaded from
@@ -61,6 +63,11 @@ pid_t process_execute(const char* file_name) {
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy(fn_copy, file_name, PGSIZE);
+
+  // remove the extra args
+  char *c = file_name;
+  while (*c != ' ') c++;
+  *c = '\0';
 
   /* Create a new thread to execute FILE_NAME. */
   tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
@@ -90,6 +97,9 @@ static void start_process(void* file_name_) {
 
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
+    success = darray_init(&t->pcb->open_files);
+    list_init(&t->pcb->children);
+    t->pcb->pid = t->tid;
     strlcpy(t->pcb->process_name, t->name, sizeof t->name);
   }
 
@@ -153,6 +163,8 @@ void process_exit(void) {
     thread_exit();
     NOT_REACHED();
   }
+  // close all file, and free the array.
+  darray_destory(&cur->pcb->open_files);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -169,6 +181,7 @@ void process_exit(void) {
     pagedir_activate(NULL);
     pagedir_destroy(pd);
   }
+
 
   /* Free the PCB of this process and kill this thread
      Avoid race where PCB is freed before t->pcb is set to NULL
@@ -259,10 +272,11 @@ struct Elf32_Phdr {
 #define PF_W 2 /* Writable. */
 #define PF_R 4 /* Readable. */
 
-static bool setup_stack(void** esp);
+static bool setup_stack(void** esp, int argc, char **argv);
 static bool validate_segment(const struct Elf32_Phdr*, struct file*);
 static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t read_bytes,
                          uint32_t zero_bytes, bool writable);
+static bool split_file_name(char *file_name, int *argc, char **argv);
 
 /* Loads an ELF executable from FILE_NAME into the current thread.
    Stores the executable's entry point into *EIP
@@ -276,6 +290,11 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   bool success = false;
   int i;
 
+
+  char *argv[65];
+  int argc = 0;
+  split_file_name(file_name, &argc, argv); 
+
   /* Allocate and activate page directory. */
   t->pcb->pagedir = pagedir_create();
   if (t->pcb->pagedir == NULL)
@@ -283,9 +302,10 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   process_activate();
 
   /* Open executable file. */
-  file = filesys_open(file_name);
+  file = filesys_open(argv[0]);
+  add_a_file(&t->pcb->open_files, file);
   if (file == NULL) {
-    printf("load: %s: open failed\n", file_name);
+    printf("load: %s: open failed\n", argv[0]);
     goto done;
   }
 
@@ -293,7 +313,7 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr ||
       memcmp(ehdr.e_ident, "\177ELF\1\1\1", 7) || ehdr.e_type != 2 || ehdr.e_machine != 3 ||
       ehdr.e_version != 1 || ehdr.e_phentsize != sizeof(struct Elf32_Phdr) || ehdr.e_phnum > 1024) {
-    printf("load: %s: error loading executable\n", file_name);
+    printf("load: %s: error loading executable\n", argv[0]);
     goto done;
   }
 
@@ -348,7 +368,7 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   }
 
   /* Set up stack. */
-  if (!setup_stack(esp))
+  if (!setup_stack(esp, argc, argv))
     goto done;
 
   /* Start address. */
@@ -358,7 +378,7 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
 
 done:
   /* We arrive here whether the load is successful or not. */
-  file_close(file);
+  file_deny_write(file);
   return success;
 }
 
@@ -463,22 +483,94 @@ static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t 
   return true;
 }
 
+static bool split_file_name(char* file_name, int* argc, char** argv) {
+  bool in_args = false;
+  int len = 0;
+  for (char *c = file_name; *c; c++) {
+    if (*c == ' ') {
+      *c = '\0';
+      in_args = false;
+    } else {
+      if (!in_args) {
+        in_args = true;
+        argv[len++] = c;
+      }
+    }
+  }
+  argv[len] = NULL;
+  *argc = len;
+  return true;
+}
+
+static bool pass_argment(void** esp, int argc, char **argv);
+
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
-static bool setup_stack(void** esp) {
+static bool setup_stack(void** esp, int argc, char **argv) {
   uint8_t* kpage;
   bool success = false;
 
   kpage = palloc_get_page(PAL_USER | PAL_ZERO);
   if (kpage != NULL) {
     success = install_page(((uint8_t*)PHYS_BASE) - PGSIZE, kpage, true);
-    if (success)
-      *esp = PHYS_BASE;
-    else
+    if (success) {
+      pass_argment(esp, argc, argv);
+    } else {
       palloc_free_page(kpage);
+    }
   }
   return success;
 }
+
+// helper for pass_argment
+static void *pass_one_string(void *stack_,  char *str);
+static void *pass_one_ptr(void *stack_,  char *ptr);
+static void *pass_one_int(void *stack_,  int val);
+static void *stack_align_0000(void *stack, int argc);
+
+
+static bool pass_argment(void** esp, int argc, char **argv) {
+  *esp = PHYS_BASE;
+  for (int i = argc - 1; i >= 0; i--) {
+    argv[i] = *esp = pass_one_string(*esp, argv[i]);
+  }
+  *esp = stack_align_0000(*esp, argc);
+  for (int i = argc; i >= 0; i--) {
+    *esp = pass_one_ptr(*esp, argv[i]);
+  }
+  
+  *esp = pass_one_ptr(*esp, (char *)(*esp)); //push argv
+  *esp = pass_one_int(*esp, argc); //push argc, *esp now is 0x?????0
+  *esp = pass_one_ptr(*esp, NULL);
+  return true;
+}
+
+static void *pass_one_string(void* stack_,  char *str) {
+  size_t len = strlen(str);
+  char *stack = (char *)stack_ - len - 1;
+  strlcpy(stack, str, len + 1);
+  return (void *)stack;
+}
+
+static void *pass_one_ptr(void *stack_,  char *ptr) {
+  char **stack = (char **) ((char *)stack_ - 4);
+  *stack = ptr;
+  return (void *)stack;
+}
+
+static void *pass_one_int(void *stack_,  int val) {
+  int *stack = (int *) ((char *)stack_ - 4);
+  *stack = val;
+  return (void *)stack;
+}
+
+
+
+static void *stack_align_0000(void *stack, int argc) {
+  int padding = ((unsigned)stack - (argc + 3) * 4) % 16;
+  return (void *) ((unsigned)stack - padding); 
+}
+
 
 /* Adds a mapping from user virtual address UPAGE to kernel
    virtual address KPAGE to the page table.
