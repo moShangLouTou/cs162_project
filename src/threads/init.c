@@ -135,6 +135,16 @@ int main(void) {
   /* Run actions specified on kernel command line. */
   run_actions(argv);
 
+#ifdef USERPROG
+  struct process *pcb = thread_current()->pcb;
+  for (struct list_elem *e = list_begin(&pcb->children); e != list_end(&pcb->children); ) {
+    struct child_elem *ce = list_entry(e, struct child_elem, elem);
+    e = list_next(e);
+    process_wait(ce->child_pcb->pid);
+  }
+#endif
+
+
   /* Finish up. */
   shutdown();
   thread_exit();

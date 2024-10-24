@@ -56,8 +56,8 @@ struct hash {
   size_t elem_cnt;      /* Number of elements in table. */
   size_t bucket_cnt;    /* Number of buckets, a power of 2. */
   struct list* buckets; /* Array of `bucket_cnt' lists. */
-  hash_hash_func* hash; /* Hash function. */
-  hash_less_func* less; /* Comparison function. */
+  hash_hash_func* hash; /* Hash function. similar to Java's hashcode*/     
+  hash_less_func* less; /* Comparison function. similar to Java's equals*/
   void* aux;            /* Auxiliary data for `hash' and `less'. */
 };
 

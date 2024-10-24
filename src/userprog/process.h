@@ -4,7 +4,9 @@
 #include "threads/thread.h"
 #include <stdint.h>
 #include "userprog/darray.h"
+#include "threads/synch.h"
 #include <list.h>
+
 // At most 8MB can be allocated to the stack
 // These defines will be used in Project 2: Multithreading
 #define MAX_STACK_PAGES (1 << 11)
@@ -30,9 +32,16 @@ struct process {
   char process_name[16];      /* Name of the main thread */
   struct thread* main_thread; /* Pointer to main thread */
   struct darray open_files;
-  struct process* parent;
-  struct list_elem elem;
+  pid_t parent;
   struct list children;
+  struct semaphore wait_exit;
+  int status;
+  bool is_dead;
+};
+
+struct child_elem {
+  struct process *child_pcb;
+  struct list_elem elem;  // better to directly place in struct process
 };
 
 void userprog_init(void);

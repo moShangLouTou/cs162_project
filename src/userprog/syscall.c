@@ -120,7 +120,7 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
   if (syscall_num == SYS_EXIT) {
     check_args_below_PHYS_BASE(args, 2*4);
     int status = get_user_one_word(args + 1);
-    f->eax = status;
+    pcb->status = f->eax = status;
     do_exit(status);
   }
 
@@ -302,6 +302,24 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
     shutdown_power_off();
     return;
   } 
+
+  // exec handler
+  else if (syscall_num == SYS_EXEC) {
+    check_args_below_PHYS_BASE(args, 2*4);
+    const char *file_name = (const char*)get_user_one_word(args + 1);
+    char kernel_buf[129];
+    copy_file_name(kernel_buf, file_name, 128);
+    f->eax = process_execute(kernel_buf);
+    return;
+  }
+
+  // wait handler
+  else if (syscall_num == SYS_WAIT) {
+    check_args_below_PHYS_BASE(args, 2*4);
+    pid_t pid = get_user_one_word(args + 1);
+    f->eax = process_wait(pid);
+    return;
+  }
 
   // unknown syscall num 
   else {

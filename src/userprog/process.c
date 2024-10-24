@@ -19,12 +19,23 @@
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include <hash.h>
 
-static struct semaphore temporary;
+// static struct semaphore temporary;
+static struct lock pid_lock;
+static struct hash process_table;
+
+
 static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
 static bool load(const char* file_name, void (**eip)(void), void** esp);
 bool setup_thread(void (**eip)(void), void** esp);
+static bool init_a_process(struct process* pcb, pid_t parent);
+static struct process* get_pcb_from_pid(int pid);
+static void delete_pcb(int pid);
+static pid_t allocate_pid(void);
+static unsigned my_hash_func(const struct hash_elem* e, void* aux);
+static bool my_less_func(const struct hash_elem* a, const struct hash_elem* b, void* aux);
 
 /* Initializes user programs in the system by ensuring the main
    thread has a minimal PCB so that it can execute and wait for
@@ -34,18 +45,37 @@ void userprog_init(void) {
   struct thread* t = thread_current();
   bool success;
 
+  lock_init(&pid_lock);
   /* Allocate process control block
      It is imoprtant that this is a call to calloc and not malloc,
      so that t->pcb->pagedir is guaranteed to be NULL (the kernel's
      page directory) when t->pcb is assigned, because a timer interrupt
      can come at any time and activate our pagedir */
   t->pcb = calloc(sizeof(struct process), 1);
-  success = t->pcb != NULL;
-
+  success = t->pcb != NULL && hash_init(&process_table, my_hash_func, my_less_func, NULL);
   /* Kill the kernel if we did not succeed */
   ASSERT(success);
-  t->pcb->main_thread = t;
-  list_init(&t->pcb->children);
+
+  // init the pcb of pintos's main thread
+  success = init_a_process(t->pcb, -1);
+  ASSERT(success);
+}
+
+struct start_pro_args {
+    pid_t pid; // 子进程的PID
+    pid_t p_pid; // parent's pid
+    bool loaded; // 加载状态
+    struct semaphore sema; // 信号量
+    char *file_name;
+};
+
+
+static void start_args_init(struct start_pro_args *args, char *fn) {
+  args->pid = -1;
+  args->p_pid = thread_current()->pcb->pid;
+  args->loaded = false;
+  sema_init(&args->sema, 0);
+  args->file_name = fn;
 }
 
 /* Starts a new thread running a user program loaded from
@@ -56,7 +86,8 @@ pid_t process_execute(const char* file_name) {
   char* fn_copy;
   tid_t tid;
 
-  sema_init(&temporary, 0);
+  // sema_init(&temporary, 0);
+
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page(0);
@@ -64,22 +95,37 @@ pid_t process_execute(const char* file_name) {
     return TID_ERROR;
   strlcpy(fn_copy, file_name, PGSIZE);
 
-  // remove the extra args
+  // remove the extra args of userprog
   char *c = file_name;
   while (*c != ' ') c++;
   *c = '\0';
+ 
+  // memory on stack is safe there, because this function doesn't exit before load 
+  // prepare the args of start_process
+  struct start_pro_args args;
+  start_args_init(&args, fn_copy);
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
+  tid = thread_create(file_name, PRI_DEFAULT, start_process, &args);
+  if (tid == TID_ERROR) {
     palloc_free_page(fn_copy);
-  return tid;
+    return tid;
+  }
+
+  sema_down(&args.sema);
+  if (args.loaded) {
+    return args.pid;
+  } else {
+    return -1;
+  }
 }
 
 /* A thread function that loads a user process and starts it
    running. */
-static void start_process(void* file_name_) {
-  char* file_name = (char*)file_name_;
+static void start_process(void* args_) {
+  struct start_pro_args* args = (struct start_pro_args*) args_;
+  char* file_name = args->file_name;
+
   struct thread* t = thread_current();
   struct intr_frame if_;
   bool success, pcb_success;
@@ -93,14 +139,8 @@ static void start_process(void* file_name_) {
     // Ensure that timer_interrupt() -> schedule() -> process_activate()
     // does not try to activate our uninitialized pagedir
     new_pcb->pagedir = NULL;
-    t->pcb = new_pcb;
-
-    // Continue initializing the PCB as normal
-    t->pcb->main_thread = t;
-    success = darray_init(&t->pcb->open_files);
-    list_init(&t->pcb->children);
-    t->pcb->pid = t->tid;
-    strlcpy(t->pcb->process_name, t->name, sizeof t->name);
+    success = init_a_process(new_pcb, args->p_pid);
+    args->pid = t->pcb->pid;
   }
 
   /* Initialize interrupt frame and load executable. */
@@ -114,6 +154,7 @@ static void start_process(void* file_name_) {
 
   /* Handle failure with succesful PCB malloc. Must free the PCB */
   if (!success && pcb_success) {
+
     // Avoid race where PCB is freed before t->pcb is set to NULL
     // If this happens, then an unfortuantely timed timer interrupt
     // can try to activate the pagedir, but it is now freed memory
@@ -122,10 +163,14 @@ static void start_process(void* file_name_) {
     free(pcb_to_free);
   }
 
+  // sema_up(&load_sucess);
   /* Clean up. Exit on failure or jump to userspace */
   palloc_free_page(file_name);
+  args->loaded = success;
+  sema_up(&args->sema);
+
   if (!success) {
-    sema_up(&temporary);
+    // sema_up(&temporary);
     thread_exit();
   }
 
@@ -139,6 +184,7 @@ static void start_process(void* file_name_) {
   NOT_REACHED();
 }
 
+
 /* Waits for process with PID child_pid to die and returns its exit status.
    If it was terminated by the kernel (i.e. killed due to an
    exception), returns -1.  If child_pid is invalid or if it was not a
@@ -148,9 +194,34 @@ static void start_process(void* file_name_) {
 
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
-int process_wait(pid_t child_pid UNUSED) {
-  sema_down(&temporary);
-  return 0;
+int process_wait(pid_t child_pid) {
+  if (child_pid <= 0) {
+    return -1;
+  }
+  struct process *child = NULL;
+  struct child_elem *ce = NULL;
+  struct process *self = thread_current()->pcb;
+  for (struct list_elem *e = list_begin(&self->children); e != list_end(&self->children); e = list_next(e)) {
+    ce = list_entry(e, struct child_elem, elem);
+    if (ce->child_pcb->pid == child_pid) {
+      child = ce->child_pcb;
+      break;
+    }
+  }
+
+  if (!child) {
+    return -1;
+  }
+  if (child->parent != self->pid) {
+    return -1;
+  }
+  sema_down(&child->wait_exit);
+  list_remove(&ce->elem);
+  free(ce);
+  int status = child->status;
+  free(child);
+  delete_pcb(child_pid);
+  return status;
 }
 
 /* Free the current process's resources. */
@@ -163,12 +234,15 @@ void process_exit(void) {
     thread_exit();
     NOT_REACHED();
   }
+
+  struct process *pcb = cur->pcb;
+
   // close all file, and free the array.
-  darray_destory(&cur->pcb->open_files);
+  darray_destory(&pcb->open_files);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
-  pd = cur->pcb->pagedir;
+  pd = pcb->pagedir;
   if (pd != NULL) {
     /* Correct ordering here is crucial.  We must set
          cur->pcb->pagedir to NULL before switching page directories,
@@ -177,21 +251,25 @@ void process_exit(void) {
          directory before destroying the process's page
          directory, or our active page directory will be one
          that's been freed (and cleared). */
-    cur->pcb->pagedir = NULL;
+    pcb->pagedir = NULL;
     pagedir_activate(NULL);
     pagedir_destroy(pd);
   }
 
+  for (struct list_elem *e = list_begin(&pcb->children); e != list_end(&pcb->children); ) {
+    struct child_elem *ce = list_entry(e, struct child_elem, elem);
+    e = list_next(e);
+    ce->child_pcb->parent = 1;
+    list_remove(&ce->elem);
+    list_push_back(&get_pcb_from_pid(1)->children, &ce->elem);
+  }
 
-  /* Free the PCB of this process and kill this thread
-     Avoid race where PCB is freed before t->pcb is set to NULL
-     If this happens, then an unfortuantely timed timer interrupt
-     can try to activate the pagedir, but it is now freed memory */
-  struct process* pcb_to_free = cur->pcb;
+
   cur->pcb = NULL;
-  free(pcb_to_free);
+  pcb->is_dead = true;
+  sema_up(&pcb->wait_exit);
 
-  sema_up(&temporary);
+  
   thread_exit();
 }
 
@@ -303,11 +381,12 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
 
   /* Open executable file. */
   file = filesys_open(argv[0]);
-  add_a_file(&t->pcb->open_files, file);
   if (file == NULL) {
     printf("load: %s: open failed\n", argv[0]);
     goto done;
   }
+  add_a_file(&t->pcb->open_files, file);
+  file_deny_write(file);
 
   /* Read and verify executable header. */
   if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr ||
@@ -378,7 +457,6 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
 
 done:
   /* We arrive here whether the load is successful or not. */
-  file_deny_write(file);
   return success;
 }
 
@@ -594,7 +672,7 @@ static bool install_page(void* upage, void* kpage, bool writable) {
 bool is_main_thread(struct thread* t, struct process* p) { return p->main_thread == t; }
 
 /* Gets the PID of a process */
-pid_t get_pid(struct process* p) { return (pid_t)p->main_thread->tid; }
+pid_t get_pid(struct process* p) { return p->pid; }
 
 /* Creates a new stack for the thread and sets up its arguments.
    Stores the thread's entry point into *EIP and its initial stack
@@ -654,3 +732,126 @@ void pthread_exit(void) {}
    This function will be implemented in Project 2: Multithreading. For
    now, it does nothing. */
 void pthread_exit_main(void) {}
+
+
+
+
+//  hash table maps pid to struct process*
+
+struct my_hashtable_elem {
+   pid_t pid; // key
+   struct process *pcb; // value
+   struct hash_elem elem;
+};
+
+
+static unsigned int murmurhash3(unsigned int key) {
+    key ^= key >> 16;
+    key *= 0x85ebca6b;
+    key ^= key >> 13;
+    key *= 0xc2b2ae35;
+    key ^= key >> 16;
+    return key;
+}
+
+static unsigned my_hash_func(const struct hash_elem* e, void* aux) {
+  struct my_hashtable_elem* he = hash_entry(e, struct my_hashtable_elem, elem);
+  return murmurhash3(he->pid);
+}
+
+
+
+static bool my_less_func(const struct hash_elem* a, const struct hash_elem* b, void* aux) {
+  struct my_hashtable_elem* ha = hash_entry(a, struct my_hashtable_elem, elem);
+  struct my_hashtable_elem* hb = hash_entry(b, struct my_hashtable_elem, elem);
+  return ha->pid < hb->pid; 
+}
+
+
+static bool init_a_process(struct process* pcb, pid_t parent) {
+  memset(pcb, 0, sizeof *pcb);
+
+
+    struct thread* t = thread_current();
+    t->pcb = pcb;
+    pcb->main_thread = t;
+
+    pcb->parent = parent;
+    list_init(&pcb->children);
+    struct child_elem *ce = NULL;
+    if (parent > 1) {
+      ce = malloc(sizeof(struct child_elem));
+      if (!ce) {
+        goto ce_false;
+      }
+      ce->child_pcb = pcb;
+      struct process * p_pcb = get_pcb_from_pid(parent);
+      ASSERT (!p_pcb);
+      list_push_back(&p_pcb->children, &ce->elem);
+    }
+    if (!darray_init(&pcb->open_files)) {
+      goto darray_false;
+    }
+
+    strlcpy(pcb->process_name, t->name, sizeof t->name);
+    struct my_hashtable_elem *map = malloc(sizeof(struct my_hashtable_elem));
+    if (!map) {
+      goto map_false;
+    }
+    pcb->pid = allocate_pid();
+    map->pid = pcb->pid;
+    map->pcb = pcb;
+    hash_insert(&process_table, &map->elem);
+    sema_init(&pcb->wait_exit, 0);
+    pcb->status = -1;
+    pcb->is_dead = false;
+    return true;
+map_false:
+    darray_destory(&pcb->open_files);
+darray_false:
+    if (ce) {
+      list_remove(&ce->elem);
+      free(ce);
+    }
+ce_false:
+    return false;
+}
+
+static struct my_hashtable_elem* get_he(int pid) {
+  struct my_hashtable_elem temp;
+  temp.pid = pid;
+  struct hash_elem* he = hash_find(&process_table, &temp.elem);
+  if (!he) {
+    return NULL;
+  } 
+  return hash_entry(he, struct my_hashtable_elem, elem);
+}
+
+static struct process* get_pcb_from_pid(int pid) {
+  struct my_hashtable_elem* he = get_he(pid);
+  if (!he) {
+    return NULL;
+  } else {
+    return he->pcb;
+  }
+}
+
+static void delete_pcb(int pid) {
+  struct my_hashtable_elem* he = get_he(pid);
+  hash_delete(&process_table, &he->elem);
+  free(he);
+}
+
+
+
+
+static pid_t allocate_pid(void) {
+  static tid_t next_pid = 1;
+  tid_t pid;
+
+  lock_acquire(&pid_lock);
+  pid = next_pid++;
+  lock_release(&pid_lock);
+
+  return pid;
+}

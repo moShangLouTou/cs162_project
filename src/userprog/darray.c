@@ -12,13 +12,14 @@ bool darray_init(struct darray* darray) {
   return true;
 }
 
+
 bool double_size(struct darray* darray) {
-  void *new = realloc(darray->array_, darray->size * 2);
+  void *new = realloc(darray->array_, darray->size * 2 * sizeof(struct file*));
   if (!new) {
     return false;
   }
   darray->array_ = new;
-  memset(darray->array_ + darray->size, 0, darray->size*4);
+  memset(darray->array_ + darray->size, 0, darray->size * sizeof(struct file*));
   darray->size *= 2;
   return true;
 }
