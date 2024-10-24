@@ -97,7 +97,7 @@ pid_t process_execute(const char* file_name) {
 
   // remove the extra args of userprog
   char *c = file_name;
-  while (*c != ' ') c++;
+  while (*c != ' ' && *c != '\0') c++;
   *c = '\0';
  
   // memory on stack is safe there, because this function doesn't exit before load 
@@ -779,14 +779,14 @@ static bool init_a_process(struct process* pcb, pid_t parent) {
     pcb->parent = parent;
     list_init(&pcb->children);
     struct child_elem *ce = NULL;
-    if (parent > 1) {
+    if (parent >= 1) {
       ce = malloc(sizeof(struct child_elem));
       if (!ce) {
         goto ce_false;
       }
       ce->child_pcb = pcb;
       struct process * p_pcb = get_pcb_from_pid(parent);
-      ASSERT (!p_pcb);
+      ASSERT (p_pcb);
       list_push_back(&p_pcb->children, &ce->elem);
     }
     if (!darray_init(&pcb->open_files)) {

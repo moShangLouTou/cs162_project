@@ -1,11 +1,13 @@
 #include "userprog/syscall.h"
 #include <stdio.h>
+#include <string.h>
 #include <syscall-nr.h>
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "userprog/process.h"
 #include "threads/vaddr.h"
 #include "filesys/filesys.h"
+#include "filesys/directory.h"
 #include "threads/synch.h"
 #include "devices/input.h"
 #include "devices/shutdown.h"
@@ -93,7 +95,7 @@ static bool put_user_one_byte (uint8_t *udst, uint8_t byte) {
 static bool copy_from_kernel(char *to, const char *from, unsigned long n) {
   // check_args_below_PHYS_BASE(to, n);
   for (unsigned i = 0; i < n; i++) {
-    if (!put_user_one_byte(to, from[i])) {
+    if (!put_user_one_byte(to + i, from[i])) {
       do_exit(-1);
     }
   }
@@ -204,8 +206,12 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
     check_args_below_PHYS_BASE(args, 3*4);
     const char *file_name = (const char*)get_user_one_word(args + 1);
     unsigned init_size = (unsigned)get_user_one_word(args + 2);
-    char kernel_buf[15];
-    copy_file_name(kernel_buf, file_name, 14);
+    char kernel_buf[17];
+    copy_file_name(kernel_buf, file_name, 16);
+    if (strlen(kernel_buf) > NAME_MAX) {
+      f->eax = false;
+      return;
+    }
     lock_acquire(&filesys_lock);
     f->eax = filesys_create(kernel_buf, init_size);
     lock_release(&filesys_lock);
